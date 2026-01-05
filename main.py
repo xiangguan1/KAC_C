@@ -39,58 +39,28 @@ class LLMCVG(nn.Module):
                  model_name="xxx", use_partial_layers=False, num_layers=4):
         super(LLMCVG, self).__init__()
         self.lora_config = LoraConfig(
-            r=256,
-            lora_alpha=256,
+            r=r,
+            lora_alpha=r, 
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-            # lora_dropout=0.2,
             bias="none"
         )
         self.device = device
         self.use_partial_layers = use_partial_layers
         self.num_layers = num_layers
-
-        # self.self_attn = MultiheadAttention(
-        #     embed_dim=hidden_size,
-        #     num_heads=8,
-        #     dropout=0.1,
-        #     batch_first=True  # 使用batch_first格式更易处理
-        # ).to(device)
         
         self.cross_attn = MultiheadAttention(embed_dim=hidden_size,num_heads=8,dropout=0.1).to(device)
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.tokenizer.add_special_tokens({'pad_token': "<|reserved_special_token_0|>"})
 
-        # 加载完整模型
         model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
         
         self.qwen = get_peft_model(model, self.lora_config)
 
-        # 分类相关结构
         self.filter_1 = nn.Linear(hidden_size, hidden_size//2).to(device)
         self.filter_2 = nn.Linear(hidden_size//2, 11).to(device)
 
         self.ls = nn.CrossEntropyLoss()
-
-        self.gen_config = transformers.GenerationConfig(
-            max_new_tokens=8,
-            min_new_tokens=None,
-            do_sample=False,
-            num_beams=1,
-            use_cache=False,
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.eos_token_id,
-            typical_p=1.0,
-            repetition_penalty=1.176,
-
-            num_return_sequences=1,
-            return_dict_in_generate=True,
-            output_hidden_states=True
-        )
-
-        self.count_split = 0
-        self.count_xxx = 0
-        self.defendant_null = 0
     
     def find_optimal_threshold(self, similarity_scores):
         similarity_scores = similarity_scores.float().cpu().numpy()
@@ -138,7 +108,7 @@ class LLMCVG(nn.Module):
 
         sum_embeddings = torch.sum(sentence_embeddings * mask_expanded, dim=1)
         sum_mask = attention_mask.sum(dim=1, keepdim=True)
-        sentence_embeddings = sum_embeddings / sum_mask  # [num_sentences, hidden_size]
+        sentence_embeddings = sum_embeddings / sum_mask  
         
         pres_charges = self.filter_1(sentence_embeddings)
         pres_charges = pres_charges.mean(dim=0, keepdim=True)
@@ -161,14 +131,14 @@ class LLMCVG(nn.Module):
         acc_input_ids = acc_inputs.input_ids
         acc_embeddings = self.qwen.base_model.model.model.embed_tokens(acc_input_ids)
 
-        acc_embeddings = acc_embeddings.mean(dim=1)  # [num_acc, hidden_size]
+        acc_embeddings = acc_embeddings.mean(dim=1)
 
-        sentence_embeddings_norm = F.normalize(sentence_embeddings, p=2, dim=1)  # [num_sentences, hidden_dim]
+        sentence_embeddings_norm = F.normalize(sentence_embeddings, p=2, dim=1) 
         acc_embeddings = F.normalize(acc_embeddings, p=2, dim=1)
         
-        similarity_matrix = torch.mm(sentence_embeddings_norm, acc_embeddings.T)  # [num_sentences, num_acc]
+        similarity_matrix = torch.mm(sentence_embeddings_norm, acc_embeddings.T)  
         
-        sentence_similarities = similarity_matrix.mean(dim=1)  # [num_sentences]
+        sentence_similarities = similarity_matrix.mean(dim=1)  
         
 
         threshold = self.find_optimal_threshold(sentence_similarities)
@@ -185,8 +155,7 @@ class LLMCVG(nn.Module):
         acu_combined_text = f"{filter_fact}\n{format_prefix}"
         cvg_ids = self.tokenizer(acu_combined_text, return_tensors="pt", padding=True, truncation=True).to(self.device)
         cvg_embs = self.qwen.base_model.model.model.embed_tokens(cvg_ids["input_ids"])
-        # pdb.set_trace()
-        # cvg_ids['attention_mask'] = torch.cat(
+
         fact_ids = self.tokenizer(filter_fact, return_tensors="pt", padding=True, truncation=True)["input_ids"]
 
         fact_length = fact_ids.size(1)  
@@ -218,7 +187,7 @@ class LLMCVG(nn.Module):
 def train(model, fact, true_label, knowledge, e):
     epoch_loss_issue, epoch_loss_pres_issues = 0, 0
     iters = 0
-    model.train()  # 改动
+    model.train()  
     for batch in tqdm(train_dataloader):
         optimizer.zero_grad()
         filter_fact, pres_charges = model.filter_token(fact, knowledge)
