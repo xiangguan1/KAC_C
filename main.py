@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import transformers
 import huggingface_hub
-import datetime  # 添加这一行
 from peft import LoraConfig, get_peft_model
 import re
 from torch.utils.data import DataLoader
@@ -93,45 +92,22 @@ class LLMCVG(nn.Module):
         self.count_xxx = 0
         self.defendant_null = 0
     
-    def find_optimal_threshold(self, similarity_scores, method='otsu'):
-        """找到最优的阈值来区分重要和不重要的token"""
-        
+    def find_optimal_threshold(self, similarity_scores):
         similarity_scores = similarity_scores.float().cpu().numpy()
-
-        if method == 'otsu':
-            # 使用Otsu方法找到最优阈值
-            scores_np = np.array(similarity_scores)
-            if len(np.unique(scores_np)) > 1:
-                threshold = threshold_otsu(scores_np)
-            else:
-                threshold = np.mean(scores_np)
-        elif method == 'mean':
-            threshold = np.mean(similarity_scores)
-        elif method == 'median':
-            threshold = np.median(similarity_scores)
-        elif method == 'adaptive':
-            # 自适应阈值：平均值加上标准差的一部分
-            scores_np = np.array(similarity_scores)
-            threshold = np.mean(scores_np) + 0.5 * np.std(scores_np)
-        else:
-            threshold = 0.5
-        
+        scores_np = np.array(similarity_scores)
+        threshold = threshold_otsu(scores_np)
         return threshold
     
     def get_final_sentences_mask(self, sentences, important_indices):
-        """使用布尔掩码，避免集合操作"""
         n = len(sentences)
         
-        # 创建布尔掩码
         include_mask = torch.zeros(n, dtype=torch.bool)
         
-        # 将重要句子及其上下文标记为True
         for idx in important_indices:
             start = max(0, idx - 1)
             end = min(n, idx + 2)
             include_mask[start:end] = True
         
-        # 获取最终句子
         final_indices = torch.where(include_mask)[0]
         final_text = "".join([sentences[i] for i in final_indices.tolist()])
         
@@ -153,11 +129,8 @@ class LLMCVG(nn.Module):
             max_length=512
         ).to(self.device)
         
-        # 获取 token IDs
         input_ids = sentence_inputs.input_ids
         
-        # 2. 使用 embed_tokens 获取 token 嵌入
-        # 这会返回形状为 [batch_size, seq_len, hidden_size] 的张量
         sentence_embeddings = self.qwen.base_model.model.model.embed_tokens(input_ids)
 
         attention_mask = sentence_inputs.attention_mask
@@ -171,15 +144,11 @@ class LLMCVG(nn.Module):
         pres_charges = pres_charges.mean(dim=0, keepdim=True)
         pres_charges = self.filter_2(pres_charges)
 
-        # charge_emb_out = pres_charges.argmax(dim=1).unsqueeze(0)
-        # charge_emb_out = label_to_category[charge_emb_out.item()]
-        # pdb.set_trace()
         _, top_3_indices = torch.topk(pres_charges, k=3, dim=1)
-        top_3_indices = top_3_indices.squeeze()  # 从 (1, 3) 变为 (3,)
+        top_3_indices = top_3_indices.squeeze() 
 
         top_3_charges = [label[top_3_indices[i].item()] for i in range(3)]
         knowledge = knowledge[top_3_charges]
-        # top_3_charges = [label_to_category[top_3_indices[0][i].item()] for i in range(3)]
 
         acc_inputs = self.tokenizer(
             knowledge,
@@ -189,34 +158,20 @@ class LLMCVG(nn.Module):
             max_length=512
         ).to(self.device)
         
-        # 获取 token IDs
         acc_input_ids = acc_inputs.input_ids
         acc_embeddings = self.qwen.base_model.model.model.embed_tokens(acc_input_ids)
 
         acc_embeddings = acc_embeddings.mean(dim=1)  # [num_acc, hidden_size]
 
-        # 归一化句子嵌入
         sentence_embeddings_norm = F.normalize(sentence_embeddings, p=2, dim=1)  # [num_sentences, hidden_dim]
         acc_embeddings = F.normalize(acc_embeddings, p=2, dim=1)
         
-        # pdb.set_trace()
-
-        # 计算相似度矩阵
         similarity_matrix = torch.mm(sentence_embeddings_norm, acc_embeddings.T)  # [num_sentences, num_acc]
         
-        # 取每个句子与所有罪名的平均相似度
         sentence_similarities = similarity_matrix.mean(dim=1)  # [num_sentences]
         
-        # if sentence_similarities.numel() == 0:
-        #     return "".join(sentences[:3]) if sentences else ""
-        
-        # 平滑相似度曲线
-        # pdb.set_trace()
 
         threshold = self.find_optimal_threshold(sentence_similarities)
-        # threshold = find_optimal_threshold_gpu(sentence_similarities)
-        
-        # 从阶跃函数中获取重要句子索引
         important_indices = torch.where(sentence_similarities > threshold)[0]
 
         final_text = self.get_final_sentences_mask(sentences, important_indices)
