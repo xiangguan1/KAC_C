@@ -1,7 +1,55 @@
-# KAC_C
-We create a Knowledge-Aware Compression framework for long legal judgment prediction.
+# How to Use
 
-## How to Use
+# Install
+1. Clone this repository to your local machine.
+2. Install the enviroment by running
+```
+conda env create -f environment.yml
+```
 
-1. Select a model and place its name in line 38 in the `model_name` variable, then input the corresponding `hidden_size` value.  
-2. Based on the text, knowledge, and labels corresponding to the dataset passed into the `train` and `test` functions.
+
+Then try:
+
+```
+mkdir -p kac
+tar -xzf "venv.tar.gz" -C "kac"
+conda activate kac
+pip install requirements.txt
+```
+
+3. Download the model from (https://huggingface.co/)
+
+# Dataset
+MultiLJP: https://github.com/CURRENTF/HRN
+ECTHR-B: https://huggingface.co/datasets/coastalcph/lex_glue
+SCOTUS: https://huggingface.co/datasets/coastalcph/lex_glue
+SJP: https://huggingface.co/datasets/rcds/swiss_judgment_prediction
+
+# Main Performance
+## train
+run
+```
+torchrun --nproc_per_node=8 train.py \
+  --model_name_or_path {your_model_path} \
+  --dataset_name {train_dataset.json} \
+  --fact \
+  --label \
+  --knowledge \
+  --bf16 True \
+  --output_dir {your_output_path} \
+  --low_rank_training True \
+  --num_train_epochs 3 \
+  --batch_size 1 \
+  --learning_rate 1e-5 \
+  --r 8
+```
+
+## test
+run
+```
+python test.py \
+  --model_path {your_finetuned_model} \
+  --dataset_name {DATASET_NAME} \
+  --output_dir {results_output_path} \
+  --test_file {test_dataset_path}
+```
