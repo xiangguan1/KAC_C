@@ -6,7 +6,7 @@ import transformers
 import huggingface_hub
 from peft import LoraConfig, get_peft_model
 import re
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import json
 from tqdm import tqdm
 import numpy as np
@@ -17,8 +17,23 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from skimage.filters import threshold_otsu
 from datetime import datetime
+import argparse
 
-huggingface_hub.login("xxx")
+class CustomDataset(Dataset):
+    def __init__(self, data_file):
+        with open(data_file, 'r', encoding='utf-8') as f:
+            self.data = json.load(f)
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        return {
+            'fact': item['fact'],
+            'label': item['label'],
+            'knowledge': item['knowledge']
+        }
 
 def get_metrics(p, t):
     if isinstance(p, torch.Tensor):
@@ -35,8 +50,7 @@ def get_metrics(p, t):
 
 
 class LLMCVG(nn.Module):
-    def __init__(self, hidden_size='model_hidden_size', device="cpu", rand_init=False, 
-                 model_name="xxx", use_partial_layers=False, num_layers=4):
+    def __init__(self, hidden_size, device="cpu", model_name="xxx", r=8):
         super(LLMCVG, self).__init__()
         self.lora_config = LoraConfig(
             r=r,
@@ -45,10 +59,8 @@ class LLMCVG(nn.Module):
             bias="none"
         )
         self.device = device
-        self.use_partial_layers = use_partial_layers
-        self.num_layers = num_layers
         
-        self.cross_attn = MultiheadAttention(embed_dim=hidden_size,num_heads=8,dropout=0.1).to(device)
+        self.cross_attn = MultiheadAttention(embed_dim=hidden_size, num_heads=8, dropout=0.1).to(device)
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.tokenizer.add_special_tokens({'pad_token': "<|reserved_special_token_0|>"})
@@ -169,119 +181,115 @@ class LLMCVG(nn.Module):
         
         return acu_loss
 
-    def ske_generate(self, filter_fact):
+    def save_pretrained(self, output_dir):
+        self.qwen.save_pretrained(output_dir)
+        self.tokenizer.save_pretrained(output_dir)
+        torch.save({
+            'filter_1_state_dict': self.filter_1.state_dict(),
+            'filter_2_state_dict': self.filter_2.state_dict(),
+            'cross_attn_state_dict': self.cross_attn.state_dict()
+        }, os.path.join(output_dir, 'additional_layers.pth'))
 
-        format_prefix = f"In summary, this legal document belongs to the category"
-        acu_combined_text = f"{filter_fact}\n{format_prefix}"
-        fact = self.tokenizer(acu_combined_text, return_tensors="pt", padding=True, truncation=True).to(self.device)
-
-        outputs = self.qwen.generate(**fact, max_new_tokens=100, eos_token_id=self.tokenizer.eos_token_id, pad_token_id=self.tokenizer.eos_token_id)
-        outputs = self.tokenizer.batch_decode(outputs[:,fact["input_ids"].size(1):], skip_special_tokens=True)[0]
-
-        pattern = r"of ([^.]*)"  
-        match = re.search(pattern, outputs)  
-        label = match.group(1)
-
-        return label
-
-def train(model, fact, true_label, knowledge, e):
+def train_epoch(model, dataloader, optimizer, device, epoch):
+    model.train()  
     epoch_loss_issue, epoch_loss_pres_issues = 0, 0
     iters = 0
-    model.train()  
-    for batch in tqdm(train_dataloader):
+    
+    for batch in tqdm(dataloader, desc=f"Epoch {epoch}"):
         optimizer.zero_grad()
-        filter_fact, pres_charges = model.filter_token(fact, knowledge)
-        issue_loss = model.forward(filter_fact, true_label)
-        target = torch.tensor(batch['labels'], dtype=torch.long).to(device)
+        
+        fact = batch['fact'][0]
+        label = batch['label'][0]
+        knowledge = batch['knowledge'][0]
+        
+        filter_fact, pres_charges = model.filter_token(fact, knowledge, label)
+        issue_loss = model.forward(filter_fact, label)
+        
+        target = torch.tensor([label], dtype=torch.long).to(device)
         pres_issue_loss = model.ls(pres_charges, target)
         
-        (issue_loss + pres_issue_loss).backward()
+        total_loss = issue_loss + pres_issue_loss
+        total_loss.backward()
 
         optimizer.step()
 
-
         epoch_loss_issue += issue_loss.item()
         epoch_loss_pres_issues += pres_issue_loss.item()
-        
         iters += 1
 
-    print(f"Epoch {e}:LLM Loss: {epoch_loss_issue / iters:.2f}, "f"MLP Loss: {epoch_loss_pres_issues / iters:.2f}")
+    print(f"Epoch {epoch}: LLM Loss: {epoch_loss_issue / iters:.4f}, MLP Loss: {epoch_loss_pres_issues / iters:.4f}")
 
-def test(model, fact, true_label):
-    model.eval()
-    target_issue, pres_issues_list = [], []
-
-    for batch in tqdm(test_dataloader):
-        filter_fact, _ = model.filter_token(fact) 
-
-        issue_out = model.ske_generate(filter_fact)
-        pres_issues_list.extend([issue_out])
-
-
-        target_issue.extend([true_label])
-
-    out_issues = get_metrics(pres_issues_list, target_issue)
-    print(out_issues)
-
-
-
-
-if __name__ == '__main__':
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    epochs = 100
-    batch_size = 1
-    model = LLMCVG(device=device).to(device).bfloat16()
+def main():
+    parser = argparse.ArgumentParser(description="Train LLMCVG model")
+    parser.add_argument('--model_name_or_path', type=str, required=True, help='Path to pretrained model')
+    parser.add_argument('--hidden_size', type=int, required=True, help='Hidden size of the model')
+    parser.add_argument('--dataset_name', type=str, required=True, help='Dataset name')
+    parser.add_argument('--fact', action='store_true', help='Use fact data')
+    parser.add_argument('--label', action='store_true', help='Use label data')
+    parser.add_argument('--knowledge', action='store_true', help='Use knowledge data')
+    parser.add_argument('--bf16', action='store_true', help='Use bfloat16 precision')
+    parser.add_argument('--output_dir', type=str, required=True, help='Output directory')
+    parser.add_argument('--low_rank_training', action='store_true', help='Use LoRA training')
+    parser.add_argument('--num_train_epochs', type=int, default=3, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+    parser.add_argument('--learning_rate', type=float, default=1e-5, help='Learning rate')
+    parser.add_argument('--r', type=int, default=8, help='LoRA rank')
+    
+    args = parser.parse_args()
+    
+    # Setup device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Login to HuggingFace Hub if token exists
+    hf_token = os.getenv("HF_TOKEN")
+    if hf_token:
+        huggingface_hub.login(hf_token)
+    
+    # Load dataset
+    dataset = CustomDataset(args.dataset_name)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    
+    # Initialize model
+    model = LLMCVG(
+        hidden_size=args.hidden_size,
+        device=device,
+        model_name=args.model_name_or_path,
+        r=args.r
+    ).to(device)
+    
+    if args.bf16:
+        model = model.bfloat16()
+    
+    # Freeze base model parameters, only train LoRA and linear layers
     for name, param in model.named_parameters():
-        if "lora" not in name and "qwen" in name:  
+        if "lora" not in name and "qwen" in name:
             param.requires_grad = False
             if "lm_head" in name:
                 param.requires_grad = True
-
-    linear_params = list(model.filter_1.parameters()) + list(model.filter_2.parameters())
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
-
-
-    train = json.load(open("xxx", 'r', encoding='utf-8'))
-    test = json.load(open("xxx", 'r', encoding='utf-8'))
-
-
-    train_dataloader = DataLoader(train, batch_size=batch_size, shuffle=False, num_workers=0, drop_last=False)
-
-    test_dataloader = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=0, drop_last=False)
-
-
-    for e in range(epochs):
-        train(model, fact, true_label, knowledge, e)
-
-        out_issues = test(model, fact, true_label)
-
-        print(f"Epoch {e}: issues: {out_issues}")
-
-        rmse_r = out_issues["f1"]
-
-        if rmse_r > best_rmse:
-            print("=" * 10 + "BEST EPOCH" + "=" * 10)
-            best_rmse = rmse_r
-            count = 0
-            best_issues = out_issues
-
-        else:
-            count += 1
-
-        if count >= 15:
-            print("Early stopping because metric not improving.")
-            break
+    
+    # Setup optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    
+    # Training loop
+    best_f1 = 0
+    patience_count = 0
+    patience = 15
+    
+    for epoch in range(args.num_train_epochs):
+        train_epoch(model, dataloader, optimizer, device, epoch)
         
-        print("*" * 10 + "BEST" + "*" * 10)
-        print(f"BEST Result => BEST: {best_issues}")
+        # Save checkpoint
+        checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{epoch}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        model.save_pretrained(checkpoint_dir)
+        
+        # Simple early stopping (in practice, you'd want to evaluate on validation set)
+        # For now, just save every epoch
+        print(f"Checkpoint saved to {checkpoint_dir}")
+    
+    # Save final model
+    model.save_pretrained(args.output_dir)
+    print(f"Model saved to {args.output_dir}")
 
-        print("Done.")
-
-
-
-
-
-
-
-
+if __name__ == '__main__':
+    main()
