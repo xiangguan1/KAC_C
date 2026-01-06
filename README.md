@@ -1,5 +1,7 @@
 # How to Use
 
+[![License: APACHE-2.0](https://img.shields.io/badge/License-Apache%202.0-yellow)](https://www.apache.org/licenses/LICENSE-2.0)
+
 # Install
 1. Clone this repository to your local machine.
 2. Install the enviroment by running
