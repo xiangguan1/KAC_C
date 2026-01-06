@@ -4,7 +4,7 @@
 
 # Install
 1. Clone this repository to your local machine.
-2. Install the enviroment by running
+2. Install the environment by running
 ```
 conda env create -f environment.yml
 ```
